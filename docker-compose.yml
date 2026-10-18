@@ -1,0 +1,168 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: firewatch
+      POSTGRES_USER: firewatch
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}
+    volumes:
+      - firewatch_pg:/var/lib/postgresql/data
+    networks: [scanner_internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U firewatch -d firewatch"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  egress-proxy:
+    build:
+      context: ./deploy/egress
+      dockerfile: Dockerfile
+    networks: [scanner_internal, egress_net]
+    restart: unless-stopped
+    # No published port: only scanner-side containers can access this proxy.
+
+  migrate:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://firewatch:${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}@db:5432/firewatch
+    networks: [scanner_internal]
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      APP_NAME: FIREWATCH Web Security Agent
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DATABASE_URL: postgresql+psycopg://firewatch:${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}@db:5432/firewatch
+      FIREWATCH_API_KEY: ${FIREWATCH_API_KEY:-}
+      FIREWATCH_ALLOW_MASTER_KEY: ${FIREWATCH_ALLOW_MASTER_KEY:-false}
+      FIREWATCH_TENANT_AUTH_ENABLED: ${FIREWATCH_TENANT_AUTH_ENABLED:-true}
+      FIREWATCH_SECRET_KEY: ${FIREWATCH_SECRET_KEY:-}
+      FIREWATCH_SECRET_KEY_FILE: /data/secret.key
+      EGRESS_PROXY_URL: http://egress-proxy:3128
+      ENABLE_INLINE_WORKER: ${ENABLE_INLINE_WORKER:-true}
+      ALLOW_PRIVATE_TARGETS: ${ALLOW_PRIVATE_TARGETS:-false}
+      REQUIRE_SCOPE_ACK: "true"
+      MAX_PAGES: ${MAX_PAGES:-300}
+      MAX_DEPTH: ${MAX_DEPTH:-8}
+      MAX_ENDPOINTS: ${MAX_ENDPOINTS:-2000}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-15}
+      REQUEST_DELAY_MS: ${REQUEST_DELAY_MS:-150}
+      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-4}
+      MAX_PARAMETER_PROBES: ${MAX_PARAMETER_PROBES:-60}
+      ENABLE_SAFE_PARAMETER_PROBES: ${ENABLE_SAFE_PARAMETER_PROBES:-true}
+      RESPECT_ROBOTS: ${RESPECT_ROBOTS:-true}
+      ENABLE_BROWSER: ${ENABLE_BROWSER:-true}
+      ENABLE_API_INTROSPECTION: ${ENABLE_API_INTROSPECTION:-true}
+      ENABLE_ZAP: ${ENABLE_ZAP:-false}
+      ZAP_BASE_URL: ${ZAP_BASE_URL:-http://zap:8080}
+      ZAP_API_KEY: ${ZAP_API_KEY:-}
+      ZAP_MAX_DURATION_SECONDS: ${ZAP_MAX_DURATION_SECONDS:-90}
+      ZAP_MAX_ALERTS: ${ZAP_MAX_ALERTS:-500}
+      WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-60}
+      WORKER_HEARTBEAT_SECONDS: ${WORKER_HEARTBEAT_SECONDS:-15}
+      REPORT_DIR: /data/reports
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
+    volumes:
+      - firewatch_data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      egress-proxy:
+        condition: service_started
+    networks: [scanner_internal]
+    ports:
+      - "127.0.0.1:${FIREWATCH_HTTP_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    profiles: ["external-worker"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DATABASE_URL: postgresql+psycopg://firewatch:${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}@db:5432/firewatch
+      FIREWATCH_API_KEY: ${FIREWATCH_API_KEY:-}
+      FIREWATCH_ALLOW_MASTER_KEY: ${FIREWATCH_ALLOW_MASTER_KEY:-false}
+      FIREWATCH_TENANT_AUTH_ENABLED: ${FIREWATCH_TENANT_AUTH_ENABLED:-true}
+      FIREWATCH_SECRET_KEY: ${FIREWATCH_SECRET_KEY:-}
+      FIREWATCH_SECRET_KEY_FILE: /data/secret.key
+      EGRESS_PROXY_URL: http://egress-proxy:3128
+      ENABLE_INLINE_WORKER: "false"
+      ALLOW_PRIVATE_TARGETS: ${ALLOW_PRIVATE_TARGETS:-false}
+      ENABLE_BROWSER: ${ENABLE_BROWSER:-true}
+      ENABLE_ZAP: ${ENABLE_ZAP:-false}
+      ZAP_BASE_URL: ${ZAP_BASE_URL:-http://zap:8080}
+      ZAP_API_KEY: ${ZAP_API_KEY:-}
+      WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-60}
+      WORKER_HEARTBEAT_SECONDS: ${WORKER_HEARTBEAT_SECONDS:-15}
+      REPORT_DIR: /data/reports
+    volumes:
+      - firewatch_data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      egress-proxy:
+        condition: service_started
+    networks: [scanner_internal]
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+
+  zap:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    profiles: ["zap"]
+    entrypoint: ["/bin/sh", "/zap-entrypoint.sh"]
+    environment:
+      ZAP_API_KEY_FILE: /run/secrets/zap_api_key
+    secrets: [zap_api_key]
+    volumes:
+      - ./deploy/zap/entrypoint.sh:/zap-entrypoint.sh:ro
+      - zap_data:/home/zap/.ZAP
+    networks: [scanner_internal]
+    depends_on:
+      egress-proxy:
+        condition: service_started
+    restart: unless-stopped
+
+  demo:
+    build: {context: ./demo_target}
+    profiles: ["demo"]
+    networks: [scanner_internal]
+    ports:
+      - "127.0.0.1:8765:9000"
+
+networks:
+  scanner_internal:
+    internal: true
+  egress_net: {}
+
+volumes:
+  firewatch_pg:
+  firewatch_data:
+  zap_data:
+
+secrets:
+  zap_api_key:
+    file: ${ZAP_API_KEY_FILE:-./deploy/secrets/zap_api_key.example}
